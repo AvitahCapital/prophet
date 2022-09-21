@@ -161,7 +161,7 @@ prophet <- function(df = NULL,
 #'
 #' @keywords internal
 validate_inputs <- function(m) {
-  if (!(m$growth %in% c('linear', 'logistic', 'flat'))) {
+  if (!(m$growth %in% c('linear', 'logistic', 'flat', 'stepwise'))) {
     stop("Parameter 'growth' should be 'linear', 'logistic', or 'flat'.")
   }
   if ((m$changepoint.range < 0) | (m$changepoint.range > 1)) {
@@ -1116,6 +1116,20 @@ linear_growth_init <- function(df) {
   return(c(k, m))
 }
 
+#' @import dplyr
+stepwise_growth_init <- function(df, changepoints) {
+  if(length(changepoints) == 0)
+    return(c(0, mean(df$y_scaled)))
+
+  m <- arrange(df, ds) %>%
+    mutate(cat=cut(as.numeric(ds), as.numeric(c(as.POSIXct('1900-01-01'), changepoints, as.POSIXct('3000-01-01'))),
+                   right=FALSE)) %>%
+    group_by(cat) %>%
+    summarise(m=mean(y_scaled)) %>%
+    with(m)
+  return(c(0, m))
+}
+
 #' Initialize logistic growth.
 #'
 #' Provides a strong initialization for logistic growth by calculating the
@@ -1216,7 +1230,7 @@ fit.prophet <- function(m, df, ...) {
     X = as.matrix(seasonal.features),
     sigmas = array(prior.scales),
     tau = m$changepoint.prior.scale,
-    trend_indicator = switch(m$growth, 'linear'=0, 'logistic'=1, 'flat'=2),
+    trend_indicator = switch(m$growth, 'linear'=0, 'logistic'=1, 'flat'=2, 'stepwise'=3),
     s_a = array(component.cols$additive_terms),
     s_m = array(component.cols$multiplicative_terms)
   )
@@ -1231,6 +1245,11 @@ fit.prophet <- function(m, df, ...) {
   } else if (m$growth == 'logistic') {
     dat$cap <- history$cap_scaled  # Add capacities to the Stan data
     kinit <- logistic_growth_init(history)
+  } else if (m$growth == 'stepwise') {
+    dat$cap <- rep(0, nrow(history)) # Unused inside Stan
+    kinit <- stepwise_growth_init(history, m$changepoints)
+    m_ <- kinit[-1]
+    kinit <- c(0, m_[1])
   }
 
   model <- .load_model(m$backend)
@@ -1245,7 +1264,7 @@ fit.prophet <- function(m, df, ...) {
   }
 
   if (min(history$y) == max(history$y) &
-        (m$growth %in% c('linear', 'flat'))) {
+        (m$growth %in% c('linear', 'flat', 'stepwise'))) {
     # Nothing to fit.
     m$params <- stan_init()
     m$params$sigma_obs <- 0.
@@ -1407,6 +1426,17 @@ piecewise_logistic <- function(t, cap, deltas, k, m, changepoint.ts) {
   return(y)
 }
 
+stepwise <- function(t, deltas, k, m, changepoint.ts) {
+  # Get cumulative intercept at each t
+  m_t <- rep(m, length(t))
+  for (s in 1:length(changepoint.ts)) {
+    indx <- t >= changepoint.ts[s]
+    m_t[indx] <- m_t[indx] + deltas[s]
+  }
+  y <- m_t
+  return(y)
+}
+
 #' Predict trend using the prophet model.
 #'
 #' @param model Prophet object.
@@ -1429,6 +1459,8 @@ predict_trend <- function(model, df) {
     cap <- df$cap_scaled
     trend <- piecewise_logistic(
       t, cap, deltas, k, param.m, model$changepoints.t)
+  } else if (model$growth == 'stepwise') {
+    trend <- stepwise(t, deltas, k, param.m, model$changepoints.t)
   }
   return(trend * model$y.scale + df$floor)
 }
@@ -1630,6 +1662,8 @@ sample_predictive_trend <- function(model, df, iteration) {
   } else if (model$growth == 'logistic') {
     cap <- df$cap_scaled
     trend <- piecewise_logistic(t, cap, deltas, k, param.m, changepoint.ts)
+  } else if (model$growth == 'stepwise') {
+    trend <- stepwise(t, deltas, k, param.m, changepoint.ts)
   }
   return(trend * model$y.scale + df$floor)
 }
